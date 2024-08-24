@@ -52,3 +52,5 @@
 
 ​	同样的, 当 Leader 移动 HWM 后, 会向 Follower 分发请求, 同步 Follower 的 HWM.
 
+
+
