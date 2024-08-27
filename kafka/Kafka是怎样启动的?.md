@@ -444,3 +444,151 @@ def startup(): Unit = {
 2. 创建了控制的路由组件 (我随便起的名字), 将来自客户端的请求交给不同的 hander 来处理
 3. 使用线程池来处理上述请求
 4. 创建了 broker 和 controller 之间通信的管道
+
+## 处理请求 KafkaRequestHandler.scala
+
+```scala
+//KafkaRequestHandler
+def run(): Unit = {
+    threadRequestChannel.set(requestChannel)
+    while (!stopped) {
+      // We use a single meter for aggregate idle percentage for the thread pool.
+      // Since meter is calculated as total_recorded_value / time_window and
+      // time_window is independent of the number of threads, each recorded idle
+      // time should be discounted by # threads.
+      val startSelectTime = time.nanoseconds
+
+      val req = requestChannel.receiveRequest(300)
+      val endTime = time.nanoseconds
+      val idleTime = endTime - startSelectTime
+      aggregateIdleMeter.mark(idleTime / totalHandlerThreads.get)
+
+      req match {
+        case RequestChannel.ShutdownRequest =>
+          debug(s"Kafka request handler $id on broker $brokerId received shut down command")
+          completeShutdown()
+          return
+
+        case callback: RequestChannel.CallbackRequest =>
+          val originalRequest = callback.originalRequest
+          try {
+
+            // If we've already executed a callback for this request, reset the times and subtract the callback time from the 
+            // new dequeue time. This will allow calculation of multiple callback times.
+            // Otherwise, set dequeue time to now.
+            if (originalRequest.callbackRequestDequeueTimeNanos.isDefined) {
+              val prevCallbacksTimeNanos = originalRequest.callbackRequestCompleteTimeNanos.getOrElse(0L) - originalRequest.callbackRequestDequeueTimeNanos.getOrElse(0L)
+              originalRequest.callbackRequestCompleteTimeNanos = None
+              originalRequest.callbackRequestDequeueTimeNanos = Some(time.nanoseconds() - prevCallbacksTimeNanos)
+            } else {
+              originalRequest.callbackRequestDequeueTimeNanos = Some(time.nanoseconds())
+            }
+            
+            threadCurrentRequest.set(originalRequest)
+            callback.fun(requestLocal)
+          } catch {
+            case e: FatalExitError =>
+              completeShutdown()
+              Exit.exit(e.statusCode)
+            case e: Throwable => error("Exception when handling request", e)
+          } finally {
+            // When handling requests, we try to complete actions after, so we should try to do so here as well.
+            apis.tryCompleteActions()
+            if (originalRequest.callbackRequestCompleteTimeNanos.isEmpty)
+              originalRequest.callbackRequestCompleteTimeNanos = Some(time.nanoseconds())
+            threadCurrentRequest.remove()
+          }
+
+        case request: RequestChannel.Request =>
+          try {
+            request.requestDequeueTimeNanos = endTime
+            trace(s"Kafka request handler $id on broker $brokerId handling request $request")
+            threadCurrentRequest.set(request)
+            apis.handle(request, requestLocal)
+          } catch {
+            case e: FatalExitError =>
+              completeShutdown()
+              Exit.exit(e.statusCode)
+            case e: Throwable => error("Exception when handling request", e)
+          } finally {
+            threadCurrentRequest.remove()
+            request.releaseBuffer()
+          }
+
+        case RequestChannel.WakeupRequest => 
+          // We should handle this in receiveRequest by polling callbackQueue.
+          warn("Received a wakeup request outside of typical usage.")
+
+        case null => // continue
+      }
+    }
+    completeShutdown()
+  }
+
+```
+
+KafkaRequestHandler 继承了 Runable 接口是一个任务类, 后续会被交给线程
+
+1. 从参数中传递的 `requestChannel` 获取下一个请求. 
+2. 根据请求的类型, 分为 CallbackRequest(不认识)、Request(普通请求, 占大多数)、WakeupRequest(不认识) 调用对应的 handle(根据请求的类型处理) 进行处理
+
+```scala
+//KafkaRequestHandlerPool
+class KafkaRequestHandlerPool(
+  val brokerId: Int,
+  val requestChannel: RequestChannel,
+  val apis: ApiRequestHandler,
+  time: Time,
+  numThreads: Int,
+  requestHandlerAvgIdleMetricName: String,
+  logAndThreadNamePrefix : String,
+  nodeName: String = "broker"
+) extends Logging {
+  private val metricsGroup = new KafkaMetricsGroup(this.getClass)
+
+  val threadPoolSize: AtomicInteger = new AtomicInteger(numThreads)
+  /* a meter to track the average free capacity of the request handlers */
+  private val aggregateIdleMeter = metricsGroup.newMeter(requestHandlerAvgIdleMetricName, "percent", TimeUnit.NANOSECONDS)
+
+  this.logIdent = "[" + logAndThreadNamePrefix + " Kafka Request Handler on Broker " + brokerId + "], "
+  val runnables = new mutable.ArrayBuffer[KafkaRequestHandler](numThreads)
+  for (i <- 0 until numThreads) {
+    createHandler(i)
+  }
+
+  def createHandler(id: Int): Unit = synchronized {
+    runnables += new KafkaRequestHandler(id, brokerId, aggregateIdleMeter, threadPoolSize, requestChannel, apis, time, nodeName)
+    KafkaThread.daemon(logAndThreadNamePrefix + "-kafka-request-handler-" + id, runnables(id)).start()
+  }
+
+  def resizeThreadPool(newSize: Int): Unit = synchronized {
+    val currentSize = threadPoolSize.get
+    info(s"Resizing request handler thread pool size from $currentSize to $newSize")
+    if (newSize > currentSize) {
+      for (i <- currentSize until newSize) {
+        createHandler(i)
+      }
+    } else if (newSize < currentSize) {
+      for (i <- 1 to (currentSize - newSize)) {
+        runnables.remove(currentSize - i).stop()
+      }
+    }
+    threadPoolSize.set(newSize)
+  }
+
+  def shutdown(): Unit = synchronized {
+    info("shutting down")
+    for (handler <- runnables)
+      handler.initiateShutdown()
+    for (handler <- runnables)
+      handler.awaitShutdown()
+    info("shut down completely")
+  }
+}
+```
+
+KafkaRequestHandlerPool 就是每个节点用来接收请求的线程池, 重点在于 `createHandler()` 会根据配置中的参数来决定怎么样构建线程池.
+
+- `val runnables = new mutable.ArrayBuffer[KafkaRequestHandler](numThreads)` 这里的 runnables 对应上面的 KafkaRequestHandler
+- `KafkaThread.daemon(logAndThreadNamePrefix + "-kafka-request-handler-" + id, runnables(id)).start()` 每一个任务类绑定到一个线程上
+
